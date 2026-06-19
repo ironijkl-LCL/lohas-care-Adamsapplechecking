@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>喉結吞嚥監測器 (Adam's Apple Tracker)</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/facemesh/facemesh.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1e1e24;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 { margin-bottom: 10px; color: #00ffcc; }
+        .container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            border: 3px solid #00ffcc;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 640px;
+            height: 480px;
+        }
+        /* 讓視訊鏡頭畫面左右鏡像，比較符合直覺 */
+        video { transform: scaleX(-1); }
+        canvas { transform: scaleX(-1); }
+
+        .dashboard {
+            margin-top: 20px;
+            display: flex;
+            gap: 40px;
+            background: #2a2a35;
+            padding: 15px 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        .stat-box { text-align: center; }
+        .stat-val { font-size: 2.5rem; font-weight: bold; color: #00ffcc; }
+        .status-active { color: #ff3366; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <h1>喉結吞嚥動態監測</h1>
+    <p>請將鏡頭對準面部及頸部，並保持光線充足。</p>
+
+    <div class="container">
+        <video id="webvideo" autoplay playsinline></video>
+        <canvas id="outcanvas"></canvas>
+    </div>
+
+    <div class="dashboard">
+        <div class="stat-box">
+            <div>吞嚥次數</div>
+            <div id="swallowCount" class="stat-val">0</div>
+        </div>
+        <div class="stat-box">
+            <div>當前狀態</div>
+            <div id="statusText" class="stat-val" style="font-size: 1.5rem; margin-top:10px;">準備中...</div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webvideo');
+        const canvasElement = document.getElementById('outcanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        
+        const swallowCountEl = document.getElementById('swallowCount');
+        const statusTextEl = document.getElementById('statusText');
+
+        // 設定 Canvas 解析度與 Video 一致
+        canvasElement.width = 640;
+        canvasElement.height = 480;
+
+        let swallowCount = 0;
+        let isSwallowing = false;
+        let baseHistory = [];
+        const HISTORY_LIMIT = 10; 
+
+        // 監測的核心邏輯
+        function detectSwallow(landmarks) {
+            // MediaPipe Face Mesh 最底部的點（通常是下巴底端：點 152）
+            // 雖然它不直接在喉結上，但吞嚥時整個甲狀軟骨（喉結）和舌骨會向上拉引，帶動下巴與下顎肌肉集體位移
+            const chinIndex = 152; 
+            const chinY = landmarks[chinIndex].y * canvasElement.height;
+
+            // 畫出追蹤點
+            canvasCtx.beginPath();
+            canvasCtx.arc(landmarks[chinIndex].x * canvasElement.width, chinY, 8, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = '#ff3366';
+            canvasCtx.fill();
+
+            // 平滑數據（移動平均）
+            baseHistory.push(chinY);
+            if (baseHistory.length > HISTORY_LIMIT) baseHistory.shift();
+            const avgY = baseHistory.reduce((a, b) => a + b, 0) / baseHistory.length;
+
+            // 偵測相對位移變化
+            // 注意：在網頁坐標系中，Y 軸向下。吞嚥時喉結「向上拉」，代表 Y 值會「變小」
+            if (baseHistory.length >= HISTORY_LIMIT) {
+                const currentDiff = chinY - avgY;
+
+                // 閾值調校（根據實際距離可能需要微調，這裡設定一個相對變動值）
+                if (currentDiff < -5 && !isSwallowing) { 
+                    // Y 值突然變小（向上抽動）
+                    isSwallowing = true;
+                    statusTextEl.innerText = "偵測到吞嚥中...";
+                    statusTextEl.classList.add("status-active");
+                } 
+                else if (currentDiff > 2 && isSwallowing) {
+                    // Y 值回復或向下，代表完成一次吞嚥動作
+                    isSwallowing = false;
+                    swallowCount++;
+                    swallowCountEl.innerText = swallowCount;
+                    statusTextEl.innerText = "正常";
+                    statusTextEl.classList.remove("status-active");
+                }
+            }
+        }
+
+        function onResults(results) {
+            // 清除上一幀的畫布
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                if(statusTextEl.innerText === "準備中...") statusTextEl.innerText = "正常";
+                
+                const landmarks = results.multiFaceLandmarks[0];
+                detectSwallow(landmarks);
+            } else {
+                statusTextEl.innerText = "偵測不到面部/頸部";
+            }
+        }
+
+        // 初始化 MediaPipe Face Mesh
+        const faceMesh = new FaceMesh({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/facemesh/${file}`
+        });
+
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        faceMesh.onResults(onResults);
+
+        // 初始化相機
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await faceMesh.send({ image: videoElement });
+            },
+            width: 640,
+            height: 480
+        });
+        
+        camera.start().catch(err => {
+            statusTextEl.innerText = "無法開啟鏡頭: " + err.message;
+        });
+    </script>
+</body>
+</html>
