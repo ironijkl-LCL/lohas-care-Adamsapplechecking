@@ -1,176 +1,302 @@
 <!DOCTYPE html>
-<html lang="zh-Hant">
+<html lang="zh-HK">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>喉結吞嚥監測器 (Adam's Apple Tracker)</title>
+    <title>實時面部、舌頭及喉核動態吞嚥追蹤</title>
     
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/facemesh/facemesh.js" crossorigin="anonymous"></script>
-
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    
     <style>
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #1e1e24;
-            color: #fff;
+            margin: 0;
+            background-color: #1a1a1a;
             display: flex;
             flex-direction: column;
+            justify-content: center;
             align-items: center;
-            padding: 20px;
-        }
-        h1 { margin-bottom: 10px; color: #00ffcc; }
-        .container {
-            position: relative;
-            width: 640px;
-            height: 480px;
-            border: 3px solid #00ffcc;
-            border-radius: 8px;
+            height: 100vh;
+            color: white;
+            font-family: Arial, sans-serif;
             overflow: hidden;
         }
-        video, canvas {
+        .tracker-container {
+            position: relative;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        #webcam {
+            transform: scaleX(-1);
+            display: block;
+        }
+        #output_canvas {
             position: absolute;
             top: 0;
             left: 0;
-            width: 640px;
-            height: 480px;
+            transform: scaleX(-1);
+            pointer-events: none;
         }
-        /* 讓視訊鏡頭畫面左右鏡像，比較符合直覺 */
-        video { transform: scaleX(-1); }
-        canvas { transform: scaleX(-1); }
-
+        #loading_status {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 20px;
+            background: rgba(0,0,0,0.7);
+            padding: 10px 20px;
+            border-radius: 8px;
+            z-index: 10;
+        }
         .dashboard {
             margin-top: 20px;
             display: flex;
             gap: 40px;
             background: #2a2a35;
-            padding: 15px 30px;
+            padding: 12px 30px;
             border-radius: 10px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            z-index: 5;
         }
         .stat-box { text-align: center; }
-        .stat-val { font-size: 2.5rem; font-weight: bold; color: #00ffcc; }
-        .status-active { color: #ff3366; font-weight: bold; }
+        .stat-label { font-size: 14px; color: #aaa; margin-bottom: 5px; }
+        .stat-val { font-size: 2rem; font-weight: bold; color: #00ffcc; }
+        .status-active { color: #ff3366; animation: blink 0.5s infinite alternate; }
+        
+        @keyframes blink {
+            from { opacity: 1; }
+            to { opacity: 0.5; }
+        }
     </style>
 </head>
 <body>
 
-    <h1>喉結吞嚥動態監測</h1>
-    <p>請將鏡頭對準面部及頸部，並保持光線充足。</p>
-
-    <div class="container">
-        <video id="webvideo" autoplay playsinline></video>
-        <canvas id="outcanvas"></canvas>
+    <div class="tracker-container">
+        <video id="webcam" autoplay playsinline width="640" height="480"></video>
+        <canvas id="output_canvas" width="640" height="480"></canvas>
+        <div id="loading_status">高級動態模型載入中...</div>
     </div>
 
     <div class="dashboard">
         <div class="stat-box">
-            <div>吞嚥次數</div>
+            <div class="stat-label">吞嚥次數</div>
             <div id="swallowCount" class="stat-val">0</div>
         </div>
         <div class="stat-box">
-            <div>當前狀態</div>
-            <div id="statusText" class="stat-val" style="font-size: 1.5rem; margin-top:10px;">準備中...</div>
+            <div class="stat-label">當前吞嚥動態</div>
+            <div id="statusText" class="stat-val" style="font-size: 1.5rem; line-height: 2rem;">準備中...</div>
         </div>
     </div>
 
-    <script>
-        const videoElement = document.getElementById('webvideo');
-        const canvasElement = document.getElementById('outcanvas');
-        const canvasCtx = canvasElement.getContext('2d');
-        
-        const swallowCountEl = document.getElementById('swallowCount');
-        const statusTextEl = document.getElementById('statusText');
+<script>
+    const videoElement = document.getElementById('webcam');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const loadingStatus = document.getElementById('loading_status');
+    
+    const swallowCountEl = document.getElementById('swallowCount');
+    const statusTextEl = document.getElementById('statusText');
 
-        // 設定 Canvas 解析度與 Video 一致
-        canvasElement.width = 640;
-        canvasElement.height = 480;
+    // 吞嚥演算法核心變數
+    let swallowCount = 0;
+    let isSwallowing = false;
+    let aaHistory = [];
+    const HISTORY_LIMIT = 12; // 幀數快取（用來計算基底移動平均）
 
-        let swallowCount = 0;
-        let isSwallowing = false;
-        let baseHistory = [];
-        const HISTORY_LIMIT = 10; 
+    // 內嘴唇 20 個點位（舌頭追蹤用）
+    const INNER_LIPS_INDICES = [
+        78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 
+        324, 318, 402, 317, 14, 87, 178, 88, 95
+    ];
 
-        // 監測的核心邏輯
-        function detectSwallow(landmarks) {
-            // MediaPipe Face Mesh 最底部的點（通常是下巴底端：點 152）
-            // 雖然它不直接在喉結上，但吞嚥時整個甲狀軟骨（喉結）和舌骨會向上拉引，帶動下巴與下顎肌肉集體位移
-            const chinIndex = 152; 
-            const chinY = landmarks[chinIndex].y * canvasElement.height;
+    const LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144];
+    const RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380];
 
-            // 畫出追蹤點
-            canvasCtx.beginPath();
-            canvasCtx.arc(landmarks[chinIndex].x * canvasElement.width, chinY, 8, 0, 2 * Math.PI);
-            canvasCtx.fillStyle = '#ff3366';
-            canvasCtx.fill();
+    // 輔助函式：修正鏡像畫面下的文字反轉問題
+    function drawMirroredText(ctx, text, x, y, color, fontSize = "14px") {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.scale(-1, 1);
+        ctx.fillStyle = color;
+        ctx.font = `bold ${fontSize} Arial`;
+        ctx.fillText(text, 0, 0);
+        ctx.restore();
+    }
 
-            // 平滑數據（移動平均）
-            baseHistory.push(chinY);
-            if (baseHistory.length > HISTORY_LIMIT) baseHistory.shift();
-            const avgY = baseHistory.reduce((a, b) => a + b, 0) / baseHistory.length;
+    // 吞嚥邏輯辨識器
+    function trackSwallowLogic(currentAA_Y) {
+        aaHistory.push(currentAA_Y);
+        if (aaHistory.length > HISTORY_LIMIT) aaHistory.shift();
 
-            // 偵測相對位移變化
-            // 注意：在網頁坐標系中，Y 軸向下。吞嚥時喉結「向上拉」，代表 Y 值會「變小」
-            if (baseHistory.length >= HISTORY_LIMIT) {
-                const currentDiff = chinY - avgY;
+        // 計算歷史喉核平均 Y 坐標
+        const avgY = aaHistory.reduce((a, b) => a + b, 0) / aaHistory.length;
 
-                // 閾值調校（根據實際距離可能需要微調，這裡設定一個相對變動值）
-                if (currentDiff < -5 && !isSwallowing) { 
-                    // Y 值突然變小（向上抽動）
-                    isSwallowing = true;
-                    statusTextEl.innerText = "偵測到吞嚥中...";
-                    statusTextEl.classList.add("status-active");
-                } 
-                else if (currentDiff > 2 && isSwallowing) {
-                    // Y 值回復或向下，代表完成一次吞嚥動作
-                    isSwallowing = false;
-                    swallowCount++;
-                    swallowCountEl.innerText = swallowCount;
-                    statusTextEl.innerText = "正常";
-                    statusTextEl.classList.remove("status-active");
-                }
+        if (aaHistory.length >= HISTORY_LIMIT) {
+            const currentDiff = currentAA_Y - avgY;
+
+            // 網頁坐標系 Y 向下，吞嚥時喉核向上拉 = Y 突發性變小（Diff 為負數）
+            // 閾值設定為 -4.5 像素，可根據實際測試距離微調
+            if (currentDiff < -4.5 && !isSwallowing) { 
+                isSwallowing = true;
+                statusTextEl.innerText = "偵測到吞嚥中...";
+                statusTextEl.classList.add("status-active");
+            } 
+            // 當喉核回到原本高度或向下沉（Diff 恢復正數）
+            else if (currentDiff > 1.5 && isSwallowing) {
+                isSwallowing = false;
+                swallowCount++;
+                swallowCountEl.innerText = swallowCount;
+                statusTextEl.innerText = "正常";
+                statusTextEl.classList.remove("status-active");
             }
         }
+    }
 
-        function onResults(results) {
-            // 清除上一幀的畫布
-            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-            
-            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
-                if(statusTextEl.innerText === "準備中...") statusTextEl.innerText = "正常";
+    function onResults(results) {
+        if (loadingStatus) loadingStatus.style.display = 'none';
+        if (statusTextEl.innerText === "準備中...") statusTextEl.innerText = "正常";
+
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+            for (const landmarks of results.multiFaceLandmarks) {
                 
-                const landmarks = results.multiFaceLandmarks[0];
-                detectSwallow(landmarks);
-            } else {
-                statusTextEl.innerText = "偵測不到面部/頸部";
+                const imgW = canvasElement.width;
+                const imgH = canvasElement.height;
+
+                const getPoint = (index) => ({
+                    x: landmarks[index].x * imgW,
+                    y: landmarks[index].y * imgH,
+                    z: landmarks[index].z
+                });
+
+                // 1. 繪製面部基礎線條（白色）
+                drawConnectors(canvasCtx, landmarks, FACEMESH_RIGHT_EYE, {color: '#FFFFFF', lineWidth: 1.5});
+                drawConnectors(canvasCtx, landmarks, FACEMESH_LEFT_EYE, {color: '#FFFFFF', lineWidth: 1.5});
+                drawConnectors(canvasCtx, landmarks, FACEMESH_LIPS, {color: '#FFFFFF', lineWidth: 1.5});
+
+                // 2. 標註眼睛方框（青色）
+                const drawFeatureBox = (indices, label, color) => {
+                    let minX = imgW, minY = imgH, maxX = 0, maxY = 0;
+                    for (const index of indices) {
+                        const pt = getPoint(index);
+                        minX = Math.min(minX, pt.x); minY = Math.min(minY, pt.y);
+                        maxX = Math.max(maxX, pt.x); maxY = Math.max(maxY, pt.y);
+                    }
+                    const padding = 8;
+                    const boxW = (maxX - minX) + padding * 2;
+                    const boxH = (maxY - minY) + padding * 2;
+                    
+                    canvasCtx.strokeStyle = color;
+                    canvasCtx.lineWidth = 2;
+                    canvasCtx.strokeRect(minX - padding, minY - padding, boxW, boxH);
+                    
+                    drawMirroredText(canvasCtx, label, maxX + padding, minY - padding - 5, color, "14px");
+                };
+
+                drawFeatureBox(LEFT_EYE_INDICES, 'left eye', '#00FFFF');
+                drawFeatureBox(RIGHT_EYE_INDICES, 'right eye', '#00FFFF');
+
+                // 標註鼻子（青色）
+                const nosePt = getPoint(1);
+                canvasCtx.fillStyle = '#00FFFF';
+                canvasCtx.beginPath(); 
+                canvasCtx.arc(nosePt.x, nosePt.y, 4, 0, 2 * Math.PI); 
+                canvasCtx.fill();
+                drawMirroredText(canvasCtx, 'nose', nosePt.x - 8, nosePt.y + 4, '#00FFFF', "14px");
+
+                // --- 3. 舌頭動態追蹤 ---
+                let sumX = 0, sumY = 0;
+                let lipMinX = imgW, lipMaxX = 0, lipMinY = imgH, lipMaxY = 0;
+
+                for (const index of INNER_LIPS_INDICES) {
+                    const pt = getPoint(index);
+                    sumX += pt.x; sumY += pt.y;
+                    if (pt.x < lipMinX) lipMinX = pt.x;
+                    if (pt.x > lipMaxX) lipMaxX = pt.x;
+                    if (pt.y < lipMinY) lipMinY = pt.y;
+                    if (pt.y > lipMaxY) lipMaxY = pt.y;
+                }
+                
+                const mouthCenterX = sumX / INNER_LIPS_INDICES.length;
+                const mouthCenterY = sumY / INNER_LIPS_INDICES.length;
+                const mouthWidth = lipMaxX - lipMinX;
+                const mouthHeight = lipMaxY - lipMinY;
+
+                if (mouthHeight > 12) {
+                    const tongueBoxW = Math.max(25, mouthWidth * 0.45);
+                    const tongueBoxH = Math.max(35, mouthHeight * 0.65);
+                    const finalX = mouthCenterX - tongueBoxW / 2;
+                    const finalY = mouthCenterY - (tongueBoxH * 0.3);
+
+                    canvasCtx.strokeStyle = '#FFFF00';
+                    canvasCtx.lineWidth = 3;
+                    canvasCtx.strokeRect(finalX, finalY, tongueBoxW, tongueBoxH);
+                    
+                    drawMirroredText(canvasCtx, 'tongue', finalX + tongueBoxW, finalY - 5, '#FFFF00', "16px");
+                }
+
+                // --- 4. 喉核實時動態追蹤 ---
+                const chinPt = getPoint(152);       
+                const foreheadPt = getPoint(10);   
+                const noseBridgePt = getPoint(6);  
+
+                const faceHeight = chinPt.y - foreheadPt.y;
+                const faceWidth = Math.abs(getPoint(454).x - getPoint(234).x);
+
+                const tiltFactor = (chinPt.y - noseBridgePt.y) / faceHeight;
+
+                // 喉核核心位置公式
+                let adamAppleY = chinPt.y + (faceHeight * 0.16) * (1 + (tiltFactor - 0.3) * 1.0);
+                let adamAppleX = chinPt.x + (faceWidth * 0.12);
+
+                const aaBoxW = Math.max(30, faceHeight * 0.15); 
+                const aaBoxH = Math.max(30, faceHeight * 0.15); 
+
+                const aaRectX = adamAppleX - aaBoxW / 2;
+                const aaRectY = adamAppleY - aaBoxH / 2;
+
+                // 執行吞嚥監測數據傳輸
+                trackSwallowLogic(adamAppleY);
+
+                // 根據吞嚥狀態改變框的顏色以示提醒（吞嚥時變紅，平常紫色）
+                canvasCtx.strokeStyle = isSwallowing ? '#FF3366' : '#FF00FF'; 
+                canvasCtx.lineWidth = isSwallowing ? 4 : 3;
+                canvasCtx.strokeRect(aaRectX, aaRectY, aaBoxW, aaBoxH);
+
+                drawMirroredText(canvasCtx, "adam's apple", aaRectX + aaBoxW, aaRectY - 5, isSwallowing ? '#FF3366' : '#FF00FF', "16px");
             }
+        } else {
+            statusTextEl.innerText = "偵測不到面部";
         }
+        canvasCtx.restore();
+    }
 
-        // 初始化 MediaPipe Face Mesh
-        const faceMesh = new FaceMesh({
-            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/facemesh/${file}`
-        });
+    const faceMesh = new FaceMesh({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+    });
 
-        faceMesh.setOptions({
-            maxNumFaces: 1,
-            refineLandmarks: true,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5
-        });
+    faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.6
+    });
 
-        faceMesh.onResults(onResults);
+    faceMesh.onResults(onResults);
 
-        // 初始化相機
-        const camera = new Camera(videoElement, {
-            onFrame: async () => {
-                await faceMesh.send({ image: videoElement });
-            },
-            width: 640,
-            height: 480
-        });
-        
-        camera.start().catch(err => {
-            statusTextEl.innerText = "無法開啟鏡頭: " + err.message;
-        });
-    </script>
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await faceMesh.send({ image: videoElement });
+        },
+        width: 640,
+        height: 480
+    });
+    camera.start();
+</script>
+
 </body>
 </html>
